@@ -276,38 +276,39 @@ namespace mem {
 
         char* memory_pool;
         size_t pool_size;
-    
-    private:
-         /**
+        
+        /**
          * log2 of number of linear subdivisions of block sizes
          * values of 4-5 typical.
          */
-        constexpr static int SL_INDEX_COUNT_LOG2 = 5; 
+        constexpr static int sl_index_count_log2 = 5; 
+    
+    private:
         
         // these values should be private
         #ifdef TLSF_64BIT
         // all allocation sizes are aligned to 8 bytes
-        constexpr static int ALIGN_SIZE_LOG2 = 3;
+        constexpr static int align_size_log2 = 3;
         constexpr static int fl_index_max = 32; //note this means the largest block we can allocate is 2^32 bytes
         #else 
         // all allocation sizes are aligned to 4 bytes
-        const int ALIGN_SIZE_LOG2 = 2;
+        const int align_size_log2 = 2;
         const int fl_index_max = 30;
         #endif
-        constexpr static int align_size = (1 << ALIGN_SIZE_LOG2);
+        constexpr static int align_size = (1 << align_size_log2);
 
         /**
          * Allocations of sizes up to (1 << fl_index_max) are supported. 
          * Because we linearly subdivide the second-level lists and the minimum size block 
          * is N bytes, it doesn't make sense to create first-level lists for sizes smaller than
-         * sl_index_count * N or (1 << (SL_INDEX_COUNT_LOG2 + log2(N))) bytes, as we will be trying 
+         * sl_index_count * N or (1 << (sl_index_count_log2 + log2(N))) bytes, as we will be trying 
          * to split size ranges into more slots than we have available.
          * We calculate the minimum threshold size, and place all blocks below that size into 
          * the 0th first-level list. 
          */
 
-        constexpr static int sl_index_count = (1 << SL_INDEX_COUNT_LOG2);
-        constexpr static int fl_index_shift = (SL_INDEX_COUNT_LOG2+ALIGN_SIZE_LOG2);
+        constexpr static int sl_index_count = (1 << sl_index_count_log2);
+        constexpr static int fl_index_shift = (sl_index_count_log2+align_size_log2);
         constexpr static int fl_index_count = (fl_index_max - fl_index_shift + 1);
         constexpr static int small_block_size = (1 << fl_index_shift);
         
@@ -339,7 +340,7 @@ namespace mem {
         template <class U, size_t OtherDefaultSize> constexpr tlsf_allocator(const tlsf_allocator<U>& alloc) noexcept
         : memory_pool(alloc.memory_pool), pool_size(alloc.pool_size) {} 
 
-        constexpr tlsf_allocator() noexcept: memory_pool(nullptr), SL_INDEX_COUNT_LOG2(DefaultSLIndexLog2) {
+        constexpr tlsf_allocator() noexcept: memory_pool(nullptr), sl_index_count_log2(DefaultSLIndexLog2) {
             initialize(DefaultPoolSize);
         }
 
@@ -497,7 +498,7 @@ namespace mem {
             return prepare_used(block, adjust);
         }
 
-        void* create_memory_pool(size_t bytes, char* pool){
+        char* create_memory_pool(size_t bytes, char* pool){
             block_header* block;
             block_header* next;
 
@@ -540,11 +541,11 @@ namespace mem {
             next->set_used();
             next->set_prev_free();
 
-            return (void*)pool;
+            return pool;
         }
 
-        void destroy_memory_pool(char* pool){
-            block_header* block = block->offset_to_block((void*)pool, -(int)block_header_overhead);
+        void destroy_memory_pool(){
+            block_header* block = block->offset_to_block((void*)memory_pool, -(int)block_header_overhead);
 
             int fl = 0, sl = 0;
 
@@ -572,7 +573,7 @@ namespace mem {
         /*Rounds up to the next block size for allocations */
         static void mapping_search(size_t size, int* fli, int* sli){
             if (size >= small_block_size){
-                const size_t round = (1 << (tlsf_fls_sizet(size)-SL_INDEX_COUNT_LOG2))-1;
+                const size_t round = (1 << (tlsf_fls_sizet(size)-sl_index_count_log2))-1;
                 size += round;
             }
             mapping_insert(size, fli, sli);
@@ -587,7 +588,7 @@ namespace mem {
             }
             else {
                 fl = tlsf_fls_sizet(size);
-                sl = TLSF_CAST(int, size >> (fl-SL_INDEX_COUNT_LOG2))^(1 << SL_INDEX_COUNT_LOG2);
+                sl = TLSF_CAST(int, size >> (fl-sl_index_count_log2))^(1 << sl_index_count_log2);
                 fl -= (fl_index_shift-1);
             }
             *fli = fl;
