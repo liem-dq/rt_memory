@@ -1,4 +1,12 @@
-#include "tlsf.h"
+/// Object-oriented, C++ implementation of the TLSF allocator
+/// http://www.gii.upv.es/tlsf/main/docs
+/// conforms with std::allocator_traits
+#pragma once
+
+#include <new>
+#include <stdexcept>
+
+
 #include <utility>
 #include <cstdint>
 #include <cstddef>
@@ -112,54 +120,16 @@ namespace mem {
      * These values are used to find the correct list/block given the requested memory size. 
      */
 
-    /**
-     * log2 of number of linear subdivisions of block sizes
-     * values of 4-5 typical.
-     */
-    const int SL_INDEX_COUNT_LOG2 = 5; 
     
-    // these values should be private
-    #ifdef TLSF_64BIT
-    // all allocation sizes are aligned to 8 bytes
-    const int ALIGN_SIZE_LOG2 = 3;
-    const int FL_INDEX_MAX = 32; //note this means the largest block we can allocate is 2^32 bytes
-    #else 
-    // all allocation sizes are aligned to 4 bytes
-    const int ALIGN_SIZE_LOG2 = 2;
-    const int FL_INDEX_MAX = 30;
-    #endif
-    constexpr int ALIGN_SIZE = (1 << ALIGN_SIZE_LOG2);
-
-    /**
-     * Allocations of sizes up to (1 << FL_INDEX_MAX) are supported. 
-     * Because we linearly subdivide the second-level lists and the minimum size block 
-     * is N bytes, it doesn't make sense to create first-level lists for sizes smaller than
-     * SL_INDEX_COUNT * N or (1 << (SL_INDEX_COUNT_LOG2 + log2(N))) bytes, as we will be trying 
-     * to split size ranges into more slots than we have available.
-     * We calculate the minimum threshold size, and place all blocks below that size into 
-     * the 0th first-level list. 
-     */
-
-    constexpr int SL_INDEX_COUNT = (1 << SL_INDEX_COUNT_LOG2);
-    constexpr int FL_INDEX_SHIFT = (SL_INDEX_COUNT_LOG2+ALIGN_SIZE_LOG2);
-    constexpr int FL_INDEX_COUNT = (FL_INDEX_MAX - FL_INDEX_SHIFT + 1);
-    constexpr int SMALL_BLOCK_SIZE = (1 << FL_INDEX_SHIFT);
-
 
     static_assert(sizeof(int) * CHAR_BIT == 32);
     static_assert(sizeof(size_t) * CHAR_BIT >= 32);
     static_assert(sizeof(size_t) * CHAR_BIT <= 64);
 
     using tlsfptr_t = ptrdiff_t; 
-    
-    /**
-     * Block header.
-     * According to the TLSF specification:
-     * - the prev_phys_block field is only valid if the previous block is free.
-     * - the prev_phys_block is actually stored at the end of the previous block. This arrangement is to simplify the implementation.
-     * - The next_free and prev_free are only valid if the block is free. 
-     */
+
     struct block_header {
+
         /* previous physical (adjacent) block. */
         block_header* prev_phys_block;
         /* size of the block excluding the block header */
@@ -168,6 +138,24 @@ namespace mem {
         /* next and previous free blocks */
         block_header* next_free;
         block_header* prev_free;
+
+
+        /**
+         * block sizes are always a multiple of 4.
+         * the two least significant bits of the size field are used to store the block status
+         * bit 0: whether the block is busy or free
+         * bit 1: whether the previous block is busy or free
+         * 
+         * Block overhead: 
+         * The only overhead exposed during usage is the size field. The previous_phys_block field is technically stored
+         * inside the previous block. 
+         */
+        static constexpr size_t block_header_free_bit = 1 << 0;
+        static constexpr size_t block_header_prev_free_bit = 1 << 1; 
+        static constexpr size_t block_header_overhead = sizeof(size_t);
+
+        /* User data starts after the size field in a used block */
+        static constexpr size_t block_start_offset = offsetof(block_header, size) + sizeof(size_t);
         
         
         size_t get_size() const {
@@ -253,35 +241,22 @@ namespace mem {
 
     };
 
-    /**
-     * block sizes are always a multiple of 4.
-     * the two least significant bits of the size field are used to store the block status
-     * bit 0: whether the block is busy or free
-     * bit 1: whether the previous block is busy or free
-     * 
-     * Block overhead: 
-     * The only overhead exposed during usage is the size field. The previous_phys_block field is technically stored
-     * inside the previous block. 
-     */
-    static constexpr size_t block_header_free_bit = 1 << 0;
-    static constexpr size_t block_header_prev_free_bit = 1 << 1; 
-    static constexpr size_t block_header_overhead = sizeof(size_t);
+    
+    
 
-    /* User data starts after the size field in a used block */
-    static constexpr size_t block_start_offset = offsetof(block_header, size) + sizeof(size_t);
 
-    /**  
-     * A free block needs to store its header minus the size of the prev_phys_block field,
-     * and cannot be larger than the number of addressable bits for FL_INDEX. 
-     */
-    static constexpr size_t block_size_min = sizeof(block_header)- sizeof(block_header*);
-    static constexpr size_t block_size_max = TLSF_CAST(size_t, 1) << FL_INDEX_MAX;
 
-    /** 
-     * Control structure for TLSF allocator
-     */
-    class tlsf_control_block {
+    template <typename T, size_t DefaultPoolSize = 1024 * 1024>
+    class tlsf_allocator {
     public:
+        // using size_type = size_t;
+        // using difference_type = ptrdiff_t;
+        // using pointer = T*;
+        // using const_pointer = const T*;
+        // using reference = T&;
+        // using const_reference = const T&;
+        using value_type = T;
+
         /* empty lists point to this block to indicate they are free.*/
         static block_header block_null;
 
@@ -292,24 +267,51 @@ namespace mem {
         /*head of free lists*/
         block_header* blocks[FL_INDEX_COUNT][SL_INDEX_COUNT];
 
-        /* memory pool */
         char* memory_pool;
         size_t pool_size;
 
-        tlsf_control_block(size_t bytes) : pool_size(bytes) {
-            int i, j;
-            
-            block_null.next_free = &block_null;
-            block_null.prev_free = &block_null;
+        explicit tlsf_allocator(size_t size) {
+            initialize(size);
+        }
 
-            fl_bitmap = 0;
-            for (i = 0; i < FL_INDEX_COUNT; ++i){
-                sl_bitmap[i] = 0;
-                for (j=0; i<SL_INDEX_COUNT; ++j){
-                    blocks[i][j] = &block_null;
-                }
+        template <class U> tlsf_allocator(const tlsf_allocator<U>& alloc) noexcept
+        : memory_pool(alloc.memory_pool), pool_size(alloc.pool_size) {} 
+
+        template <class U, size_t OtherDefaultSize> tlsf_allocator(const tlsf_allocator<U>& alloc) noexcept
+        : memory_pool(alloc.memory_pool), pool_size(alloc.pool_size) {} 
+
+        tlsf_allocator() noexcept: memory_pool(nullptr) {
+            initialize(DefaultPoolSize);
+        }
+
+        size_t initialize(size_t size) {
+            pool_size = size;
+            if (!memory_pool) {
+                memory_pool = new char[pool_size];
+                memset(memory_pool, 0, pool_size);
+                create_memory_pool(pool_size, memory_pool);
             }
-            create_memory_pool(bytes);
+            return pool_size;
+        }
+
+        ~tlsf_allocator(){
+            if (memory_pool){
+                destroy_memory_pool(memory_pool);
+                memory_pool = nullptr;
+            }
+        }
+
+
+        T* allocate(size_t size){
+            T* ptr = static_cast<T*>(this->malloc(size * sizeof(T)));
+            if (ptr == nullptr && size > 0){
+                throw std::bad_alloc();
+            }
+            return ptr;
+        }
+
+        void deallocate(T* ptr, size_t){
+            this->free(ptr);
         }
 
         /*allocates a block of memory from the pool.*/
@@ -494,9 +496,85 @@ namespace mem {
             mapping_insert(block->get_size(), &fl, &sl);
             remove_free_block(block, fl, sl);
         }
+        template<typename U>
+        struct rebind{
+            using other = tlsf_allocator<U>;
+        };
 
+        
 
     private:
+
+        /**
+         * log2 of number of linear subdivisions of block sizes
+         * values of 4-5 typical.
+         */
+        const int SL_INDEX_COUNT_LOG2 = 5; 
+        
+        // these values should be private
+        #ifdef TLSF_64BIT
+        // all allocation sizes are aligned to 8 bytes
+        const int ALIGN_SIZE_LOG2 = 3;
+        const int FL_INDEX_MAX = 32; //note this means the largest block we can allocate is 2^32 bytes
+        #else 
+        // all allocation sizes are aligned to 4 bytes
+        const int ALIGN_SIZE_LOG2 = 2;
+        const int FL_INDEX_MAX = 30;
+        #endif
+        constexpr int ALIGN_SIZE = (1 << ALIGN_SIZE_LOG2);
+
+        /**
+         * Allocations of sizes up to (1 << FL_INDEX_MAX) are supported. 
+         * Because we linearly subdivide the second-level lists and the minimum size block 
+         * is N bytes, it doesn't make sense to create first-level lists for sizes smaller than
+         * SL_INDEX_COUNT * N or (1 << (SL_INDEX_COUNT_LOG2 + log2(N))) bytes, as we will be trying 
+         * to split size ranges into more slots than we have available.
+         * We calculate the minimum threshold size, and place all blocks below that size into 
+         * the 0th first-level list. 
+         */
+
+        constexpr int SL_INDEX_COUNT = (1 << SL_INDEX_COUNT_LOG2);
+        constexpr int FL_INDEX_SHIFT = (SL_INDEX_COUNT_LOG2+ALIGN_SIZE_LOG2);
+        constexpr int FL_INDEX_COUNT = (FL_INDEX_MAX - FL_INDEX_SHIFT + 1);
+        constexpr int SMALL_BLOCK_SIZE = (1 << FL_INDEX_SHIFT);
+        
+        
+        constexpr size_t tlsf_size(){
+            return sizeof(*this);
+        }
+
+        constexpr size_t tlsf_align_size(){
+            return ALIGN_SIZE;
+        }
+
+        constexpr size_t tlsf_block_size_min(){
+            return block_size_min;
+        }
+
+        constexpr size_t tlsf_block_size_max(){
+            return block_size_max;
+        }
+
+
+            
+        /**  
+         * A free block needs to store its header minus the size of the prev_phys_block field,
+         * and cannot be larger than the number of addressable bits for FL_INDEX. 
+         */
+        
+        constexpr size_t block_size_min = sizeof(block_header)- sizeof(block_header*);
+        constexpr size_t block_size_max = TLSF_CAST(size_t, 1) << FL_INDEX_MAX;
+        constexpr size_t pool_overhead = 2*block_header.block_header_overhead;
+        size_t tlsf_alloc_overhead = block_header.block_header_overhead;
+
+
+        // size_t align_size;
+        // size_t block_size_min;
+        // size_t block_size_max;
+        // size_t pool_overhead;
+        // size_t tlsf_alloc_overhead;
+
+
         /**
          * TLSF utility functions 
          * Based on the implementation described in this paper:
@@ -777,31 +855,38 @@ namespace mem {
             return p;
         }
 
-        constexpr size_t tlsf_size(void){
-            return sizeof(tlsf_control_block);
-        }
-
-        constexpr size_t tlsf_align_size(){
-            return ALIGN_SIZE;
-        }
-
-        constexpr size_t tlsf_block_size_min(){
-            return block_size_min;
-        }
-
-        constexpr size_t tlsf_block_size_max(){
-            return block_size_max;
-        }
-
-        constexpr size_t tlsf_pool_overhead(){
-            return 2*block_header_overhead;
-        }
-
-        constexpr size_t tlsf_alloc_overhead(){
-            return block_header_overhead;
-        }
-
     };
 
-} //namespace mem
 
+/* comparison operators required for std::allocator_traits */
+template<typename T, typename U>
+constexpr bool operator==(
+    const tlsf_allocator<T>& a,
+    const tlsf_allocator<U>& b) noexcept {
+        return a.memory_pool == b.memory_pool;
+    }
+
+template <typename T, typename U>
+constexpr bool operator!=(
+    const tlsf_allocator<T>& a,
+    const tlsf_allocator<U>& b) noexcept {
+        return a.memory_pool != b.memory_pool;
+    }
+    
+template<typename T, typename U, size_t X, size_t Y>
+constexpr bool operator==(
+    const tlsf_allocator<T,X>& a,
+    const tlsf_allocator<U,Y>& b) noexcept {
+        return a.memory_pool == b.memory_pool;
+    }
+
+template <typename T, typename U, size_t X, size_t Y>
+constexpr bool operator!=(
+    const tlsf_allocator<T,X>& a,
+    const tlsf_allocator<U,Y>& b) noexcept {
+        return a.memory_pool != b.memory_pool;
+    }
+
+#undef TLSF_MIN
+#undef TLSF_MAX
+} //namespace mem
